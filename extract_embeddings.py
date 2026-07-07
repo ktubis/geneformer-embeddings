@@ -12,6 +12,8 @@ Extracts two sets of embeddings from the final transformer layer (emb_layer=0):
                            transformer layer outputs.
                            With --cell_type: gene embeddings are computed only from cells of that
                            type; cell embeddings still use all cells.
+  - cell_embeddings.csv  : with --all_layers_cell: one file per layer named
+                           cell_embeddings_layer{N}.csv.
 
 Prerequisites
 -------------
@@ -31,6 +33,8 @@ python extract_embeddings.py \
     [--max_ncells 500] \
     [--nproc 4] \
     [--no_gene_embs] \
+    [--all_layers] \
+    [--all_layers_cell] \
     [--cell_type "L2/3 IT"] \
     [--cell_type_col cell_type]
 
@@ -43,11 +47,13 @@ Arguments
 --batch_size     Forward-pass batch size (cells per batch). Reduce if OOM. Default: 10.
 --max_ncells     Max cells to process. Pass 0 to use all cells. Default: 0 (all).
 --nproc          CPU processes for dataset operations. Default: 4.
---no_gene_embs   Skip gene embedding extraction (only extract cell embeddings).
-                 Gene embeddings can be large: ~(N_cells * avg_genes_per_cell) rows.
---cell_type      If set, gene embeddings are extracted only from cells matching this label.
-                 Cell embeddings still use all cells.
---cell_type_col  adata.obs column containing cell type labels (default: cell_type).
+--no_gene_embs     Skip gene embedding extraction (only extract cell embeddings).
+                   Gene embeddings can be large: ~(N_cells * avg_genes_per_cell) rows.
+--all_layers       Extract gene embeddings from every layer; writes gene_embeddings_layer{N}.csv.
+--all_layers_cell  Extract cell embeddings from every layer; writes cell_embeddings_layer{N}.csv.
+--cell_type        If set, gene embeddings are extracted only from cells matching this label.
+                   Cell embeddings still use all cells.
+--cell_type_col    adata.obs column containing cell type labels (default: cell_type).
 """
 
 import argparse
@@ -149,6 +155,15 @@ def main():
             "Extract gene embeddings from every layer (layer 0 = pre-transformer embedding, "
             "layers 1–N = transformer outputs). Writes one CSV per layer: "
             "gene_embeddings_layer{N}.csv. Cannot be combined with --no_gene_embs."
+        ),
+    )
+    parser.add_argument(
+        "--all_layers_cell",
+        action="store_true",
+        help=(
+            "Extract cell embeddings from every layer (layer 0 = pre-transformer embedding, "
+            "layers 1–N = transformer outputs). Writes one CSV per layer: "
+            "cell_embeddings_layer{N}.csv."
         ),
     )
     parser.add_argument(
@@ -272,25 +287,29 @@ def main():
         # ------------------------------------------------------------------ #
         # Step 2: Cell embeddings (mean-pool of gene embeddings per cell)
         # ------------------------------------------------------------------ #
-        print("\n[2/3] Extracting cell embeddings (mean-pool, final layer)...")
+        cell_layer_desc = "all layers" if args.all_layers_cell else "final layer"
+        print(f"\n[2/3] Extracting cell embeddings (mean-pool, {cell_layer_desc})...")
         cell_embex = EmbExtractor(
             model_type="Pretrained",
-            emb_mode="cell",          # mean-pool of gene token embeddings
-            emb_layer=0,              # 0 = final transformer layer
+            emb_mode="cell",
+            emb_layer="all" if args.all_layers_cell else 0,
             forward_batch_size=args.batch_size,
             max_ncells=max_ncells,
             nproc=args.nproc,
             summary_stat=None,
         )
-        cell_embs_df = cell_embex.extract_embs(
+        cell_embs = cell_embex.extract_embs(
             model_directory=str(model_dir),
             input_data_file=str(dataset_path),
             output_directory=str(output_dir),
             output_prefix="cell_embeddings",
         )
-        n_cells_out = len(cell_embs_df)
-        n_dims = len([c for c in cell_embs_df.columns if str(c).isdigit()])
-        print(f"  Done: {n_cells_out} cells x {n_dims} dims → {output_dir}/cell_embeddings.csv")
+        if args.all_layers_cell:
+            print(f"  Done: {len(cell_embs)} layers → {output_dir}/cell_embeddings_layer*.csv")
+        else:
+            n_cells_out = len(cell_embs)
+            n_dims = len([c for c in cell_embs.columns if str(c).isdigit()])
+            print(f"  Done: {n_cells_out} cells x {n_dims} dims → {output_dir}/cell_embeddings.csv")
 
         # ------------------------------------------------------------------ #
         # Step 3: Gene embeddings (contextual token embeddings, per cell)
@@ -350,7 +369,10 @@ def main():
             print("\n[3/3] Skipping gene embeddings (--no_gene_embs set).")
 
     print(f"\nAll embeddings written to: {output_dir}/")
-    print("  cell_embeddings.csv — shape (N_cells, 1152)")
+    if args.all_layers_cell:
+        print("  cell_embeddings_layer{N}.csv — one file per layer (layer 0 = embedding, 1–N = transformer)")
+    else:
+        print("  cell_embeddings.csv — shape (N_cells, 1152)")
     if not args.no_gene_embs:
         if args.all_layers:
             print("  gene_embeddings_layer{N}.csv — one file per layer (layer 0 = embedding, 1–N = transformer)")
