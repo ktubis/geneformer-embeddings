@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+*.safetensors
+*.bin
+*.sif
+*.h5ad
+*.egg-info/
+build/
+dist/
+.ipynb_checkpoints/
+.DS_Store
