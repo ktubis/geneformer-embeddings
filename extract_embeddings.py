@@ -347,6 +347,12 @@ def main():
         )
         if args.all_layers_cell:
             print(f"  Done: {len(cell_embs)} layers → {output_dir}/cell_embeddings_layer*.csv")
+            if args.save_npz:
+                layers = sorted(cell_embs.keys())
+                arr = np.stack([cell_embs[l].values for l in layers], axis=0)
+                npz_path = output_dir / "layer_cell_embs.npz"
+                np.savez(npz_path, layer_cell_embs=arr)
+                print(f"  Saved .npz → {npz_path}  shape {arr.shape}")
         else:
             n_cells_out = len(cell_embs)
             n_dims = len([c for c in cell_embs.columns if str(c).isdigit()])
