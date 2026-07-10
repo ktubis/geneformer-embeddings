@@ -304,15 +304,20 @@ def main():
         data_dir.mkdir()
         tok_dir.mkdir()
 
-        # The tokenizer expects a directory of .h5ad files
-        shutil.copy2(input_path, data_dir / input_path.name)
+        # Write h5ad to temp dir with obs_names captured as a column so it
+        # survives tokenization and can be used to align npz rows to cells.
+        print("  Adding cell IDs to temp h5ad...")
+        _adata_tok = ad.read_h5ad(input_path)
+        _adata_tok.obs["__cell_id__"] = _adata_tok.obs_names.astype(str)
+        _adata_tok.write_h5ad(data_dir / input_path.name)
+        del _adata_tok
 
         # ------------------------------------------------------------------ #
         # Step 1: Tokenize
         # ------------------------------------------------------------------ #
         print("\n[1/3] Tokenizing...")
         tk = TranscriptomeTokenizer(
-            custom_attr_name_dict=None,
+            custom_attr_name_dict={"__cell_id__": "__cell_id__"},
             nproc=args.nproc,
             model_version="V2",
         )
@@ -333,6 +338,7 @@ def main():
         cell_embex = EmbExtractor(
             model_type="Pretrained",
             emb_mode="cell",
+            emb_label=["__cell_id__"],
             emb_layer="all" if args.all_layers_cell else 0,
             forward_batch_size=args.batch_size,
             max_ncells=max_ncells,
@@ -349,10 +355,13 @@ def main():
             print(f"  Done: {len(cell_embs)} layers → {output_dir}/cell_embeddings_layer*.csv")
             if args.save_npz:
                 layers = sorted(cell_embs.keys())
-                arr = np.stack([cell_embs[l].values for l in layers], axis=0)
+                emb_cols = cell_embs[layers[0]].select_dtypes(include="number").columns
+                arr = np.stack([cell_embs[l][emb_cols].values for l in layers], axis=0)
+                cell_ids = cell_embs[layers[0]]["__cell_id__"].tolist()
                 npz_path = output_dir / "layer_cell_embs.npz"
-                np.savez(npz_path, layer_cell_embs=arr)
+                np.savez(npz_path, layer_cell_embs=arr, cell_ids=np.array(cell_ids))
                 print(f"  Saved .npz → {npz_path}  shape {arr.shape}")
+                print(f"  Cell IDs saved as 'cell_ids' key in npz")
         else:
             n_cells_out = len(cell_embs)
             n_dims = len([c for c in cell_embs.columns if str(c).isdigit()])
@@ -383,6 +392,7 @@ def main():
                 sub_tok_dir = tmpdir / "tokenized_sub"
                 sub_data_dir.mkdir()
                 sub_tok_dir.mkdir()
+                adata_sub.obs["__cell_id__"] = adata_sub.obs_names.astype(str)
                 adata_sub.write_h5ad(sub_data_dir / input_path.name)
                 del adata_sub
 
