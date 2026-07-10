@@ -25,18 +25,19 @@ Prerequisites
 
 Usage
 -----
-python extract_embeddings.py \
-    --input path/to/data.h5ad \
-    --output_dir ./embeddings \
-    --model_dir ~/geneformer/Geneformer \
-    [--batch_size 10] \
-    [--max_ncells 500] \
-    [--nproc 4] \
-    [--no_gene_embs] \
-    [--all_layers] \
-    [--all_layers_cell] \
-    [--cell_type "L2/3 IT"] \
-    [--cell_type_col cell_type]
+python extract_embeddings.py \\
+    --input path/to/data.h5ad \\
+    --output_dir ./embeddings \\
+    --model_dir ~/geneformer/Geneformer \\
+    [--batch_size 10] \\
+    [--max_ncells 500] \\
+    [--nproc 4] \\
+    [--no_gene_embs] \\
+    [--all_layers] \\
+    [--all_layers_cell] \\
+    [--cell_type "L2/3 IT"] \\
+    [--cell_type_col cell_type] \\
+    [--var_index gene_name]
 
 Arguments
 ---------
@@ -54,6 +55,9 @@ Arguments
 --cell_type        If set, gene embeddings are extracted only from cells matching this label.
                    Cell embeddings still use all cells.
 --cell_type_col    adata.obs column containing cell type labels (default: cell_type).
+--var_index        adata.var column to use as the gene index in output CSVs.
+                   Use 'var_names' to use adata.var_names as the index.
+                   Default: Ensembl IDs from the Geneformer token dictionary.
 """
 
 import argparse
@@ -62,10 +66,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 import anndata as ad
 
 
-def validate_adata(adata_path: Path, cell_type: str = None, cell_type_col: str = "cell_type") -> None:
+def validate_adata(adata_path: Path, cell_type: str = None, cell_type_col: str = "cell_type", var_index: str = None) -> None:
     """Check that the AnnData has the required columns before tokenization."""
     print(f"Loading {adata_path} for validation...")
     adata = ad.read_h5ad(adata_path)
@@ -96,6 +102,13 @@ def validate_adata(adata_path: Path, cell_type: str = None, cell_type_col: str =
         else:
             n_matching = (adata.obs[cell_type_col] == cell_type).sum()
             print(f"  Cell type filter: '{cell_type}' matches {n_matching} / {len(adata)} cells")
+    if var_index is not None and var_index != "var_names":
+        if var_index not in adata.var.columns:
+            errors.append(
+                f"  - adata.var is missing '{var_index}' column (required for --var_index).\n"
+                f"    Available columns: {list(adata.var.columns)}\n"
+                f"    Use --var_index var_names to use adata.var_names as the gene index."
+            )
     if errors:
         print("ERROR: Input AnnData is missing required fields:\n")
         for e in errors:
@@ -183,6 +196,16 @@ def main():
         help="adata.obs column containing cell type labels (default: cell_type)",
     )
     parser.add_argument(
+        "--var_index",
+        type=str,
+        default=None,
+        help=(
+            "adata.var column to use as the gene index in output CSVs. "
+            "Use 'var_names' to use adata.var_names. "
+            "Default: Ensembl IDs from the Geneformer token dictionary."
+        ),
+    )
+    parser.add_argument(
         "--allow_cpu",
         action="store_true",
         help="Allow CPU inference (patches CUDA calls). For testing only — very slow.",
@@ -242,7 +265,7 @@ def main():
     if not (model_dir / "model.safetensors").exists() and not (model_dir / "Geneformer-V2-316M").exists():
         print(f"WARNING: No model.safetensors found in {model_dir}. Make sure this is the Geneformer repo root.")
 
-    validate_adata(input_path, cell_type=args.cell_type, cell_type_col=args.cell_type_col)
+    validate_adata(input_path, cell_type=args.cell_type, cell_type_col=args.cell_type_col, var_index=args.var_index)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -255,6 +278,15 @@ def main():
             f"Install it with: pip install {model_dir}"
         )
         sys.exit(1)
+
+    # Build the Ensembl ID → desired index mapping once, before entering the temp dir.
+    if args.var_index is not None:
+        _var = ad.read_h5ad(input_path, backed="r").var
+        if args.var_index == "var_names":
+            id_to_label = dict(zip(_var["ensembl_id"], _var.index))
+        else:
+            id_to_label = dict(zip(_var["ensembl_id"], _var[args.var_index]))
+        del _var
 
     with tempfile.TemporaryDirectory(prefix="geneformer_") as tmpdir:
         tmpdir = Path(tmpdir)
@@ -322,7 +354,15 @@ def main():
                 mask = adata_full.obs[args.cell_type_col] == args.cell_type
                 adata_sub = adata_full[mask].copy()
                 del adata_full
-                print(f"  Subset: {len(adata_sub)} cells")
+                n_ct_cells = len(adata_sub)
+                print(f"  Subset: {n_ct_cells} cells")
+
+                min_cells = min(10, n_ct_cells)
+                gene_counts = np.asarray((adata_sub.X > 0).sum(axis=0)).flatten()
+                gene_mask = gene_counts >= min_cells
+                n_before = adata_sub.n_vars
+                adata_sub = adata_sub[:, gene_mask].copy()
+                print(f"  Gene filter (expressed in ≥{min_cells} cells): {n_before} → {adata_sub.n_vars} genes retained")
 
                 sub_data_dir = tmpdir / "input_data_sub"
                 sub_tok_dir = tmpdir / "tokenized_sub"
@@ -361,6 +401,20 @@ def main():
                 output_directory=str(output_dir),
                 output_prefix="gene_embeddings",
             )
+
+            # Remap Ensembl ID index to the requested var column / var_names and re-save.
+            if args.var_index is not None:
+                if args.all_layers:
+                    n_layers = len(gene_embs)
+                    pad_width = len(str(n_layers - 1))
+                    for layer_key in sorted(gene_embs.keys()):
+                        df = gene_embs[layer_key]
+                        df.index = [id_to_label.get(g, g) for g in df.index]
+                        df.to_csv(output_dir / f"gene_embeddings_layer{str(layer_key).zfill(pad_width)}.csv")
+                else:
+                    gene_embs.index = [id_to_label.get(g, g) for g in gene_embs.index]
+                    gene_embs.to_csv(output_dir / "gene_embeddings.csv")
+
             if args.all_layers:
                 print(f"  Done: {len(gene_embs)} layers → {output_dir}/gene_embeddings_layer*.csv")
             else:
