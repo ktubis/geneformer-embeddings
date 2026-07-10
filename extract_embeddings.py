@@ -206,6 +206,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--save_npz",
+        action="store_true",
+        help=(
+            "Save gene embeddings as a single .npz file (layer_gene_embs.npz) with key "
+            "'layer_gene_embs', shape (n_layers+1, n_genes, d_model) — same format as scGPT. "
+            "Requires --all_layers. Gene names are written alongside as layer_gene_embs_gene_names.txt."
+        ),
+    )
+    parser.add_argument(
         "--allow_cpu",
         action="store_true",
         help="Allow CPU inference (patches CUDA calls). For testing only — very slow.",
@@ -414,6 +423,21 @@ def main():
                 else:
                     gene_embs.index = [id_to_label.get(g, g) for g in gene_embs.index]
                     gene_embs.to_csv(output_dir / "gene_embeddings.csv")
+
+            # Save as stacked .npz matching scGPT's layer_gene_embs format.
+            if args.save_npz:
+                if not args.all_layers:
+                    print("  WARNING: --save_npz requires --all_layers; skipping .npz output.")
+                else:
+                    layers = sorted(gene_embs.keys())
+                    arr = np.stack([gene_embs[l].values for l in layers], axis=0)
+                    gene_names = gene_embs[layers[0]].index.tolist()
+                    npz_path = output_dir / "layer_gene_embs.npz"
+                    np.savez(npz_path, layer_gene_embs=arr)
+                    names_path = output_dir / "layer_gene_embs_gene_names.txt"
+                    names_path.write_text("\n".join(gene_names))
+                    print(f"  Saved .npz → {npz_path}  shape {arr.shape}")
+                    print(f"  Gene names → {names_path}")
 
             if args.all_layers:
                 print(f"  Done: {len(gene_embs)} layers → {output_dir}/gene_embeddings_layer*.csv")
