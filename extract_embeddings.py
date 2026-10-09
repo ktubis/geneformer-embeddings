@@ -12,8 +12,17 @@ Extracts two sets of embeddings from the final transformer layer (emb_layer=0):
                            transformer layer outputs.
                            With --cell_type: gene embeddings are computed only from cells of that
                            type; cell embeddings still use all cells.
+                           With --save_path PATH: written instead in scGPT's format, PATH.npz
+                           (key 'layer_gene_embs', (n_layers, n_genes, 1152) float32, and
+                           'n_cells', the cells each gene is averaged over) and
+                           PATH_gene_names.txt.
   - cell_embeddings.csv  : with --all_layers_cell: one file per layer named
                            cell_embeddings_layer{N}.csv.
+
+A gene's embedding at a layer is the mean of its token's hidden state over the cells
+whose input contains it (Geneformer's input holds only the expressed genes, rank-ordered,
+up to 4096 tokens). Sums are kept per gene and layer on the GPU, so memory does not grow
+with the number of cells. <cls> and <eos> are not genes and are left out.
 
 Prerequisites
 -------------
@@ -33,11 +42,13 @@ python extract_embeddings.py \\
     [--max_ncells 500] \\
     [--nproc 4] \\
     [--no_gene_embs] \\
+    [--no_cell_embs] \\
     [--all_layers] \\
     [--all_layers_cell] \\
     [--cell_type "L2/3 IT"] \\
     [--cell_type_col cell_type] \\
-    [--var_index gene_name]
+    [--var_index gene_name] \\
+    [--save_path path/to/embeddings/T_cell]
 
 Arguments
 ---------
@@ -49,7 +60,7 @@ Arguments
 --max_ncells     Max cells to process. Pass 0 to use all cells. Default: 0 (all).
 --nproc          CPU processes for dataset operations. Default: 4.
 --no_gene_embs     Skip gene embedding extraction (only extract cell embeddings).
-                   Gene embeddings can be large: ~(N_cells * avg_genes_per_cell) rows.
+--no_cell_embs     Skip cell embedding extraction (only extract gene embeddings).
 --all_layers       Extract gene embeddings from every layer; writes gene_embeddings_layer{N}.csv.
 --all_layers_cell  Extract cell embeddings from every layer; writes cell_embeddings_layer{N}.csv.
 --cell_type        If set, gene embeddings are extracted only from cells matching this label.
@@ -58,6 +69,9 @@ Arguments
 --var_index        adata.var column to use as the gene index in output CSVs.
                    Use 'var_names' to use adata.var_names as the index.
                    Default: Ensembl IDs from the Geneformer token dictionary.
+--save_path        Write gene embeddings as PATH.npz + PATH_gene_names.txt (scGPT's format)
+                   instead of CSVs.
+--save_npz         With --all_layers_cell: also stack the cell embeddings into layer_cell_embs.npz.
 """
 
 import argparse
@@ -67,6 +81,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 import anndata as ad
 
@@ -119,6 +134,112 @@ def validate_adata(adata_path: Path, cell_type: str = None, cell_type_col: str =
     del adata
 
 
+def token_labels(adata_path: Path, var_index: str = None):
+    """Geneformer token id -> output label for the input's genes, in adata.var order.
+
+    Ensembl IDs are mapped the way the tokenizer maps them (upper-cased, through the
+    Ensembl mapping dictionary; genes outside the token dictionary are dropped). The label
+    is the var_index column, adata.var_names for 'var_names', or the mapped Ensembl ID by
+    default. If several genes collapse into one token, it is named after the gene whose own
+    ID it is, else the first one.
+
+    Returns (tokens, labels): token ids in var order and {token id: label}.
+    """
+    import pickle
+
+    from geneformer import ENSEMBL_MAPPING_FILE, TOKEN_DICTIONARY_FILE
+
+    with open(ENSEMBL_MAPPING_FILE, "rb") as f:
+        mapping = pickle.load(f)
+    with open(TOKEN_DICTIONARY_FILE, "rb") as f:
+        token_dict = pickle.load(f)
+    var = ad.read_h5ad(adata_path, backed="r").var
+    ensembl = var["ensembl_id"].astype(str).str.upper()
+    if var_index is None:
+        names = [None] * len(var)
+    elif var_index == "var_names":
+        names = var.index.astype(str)
+    else:
+        names = var[var_index].astype(str)
+
+    tokens, labels = [], {}
+    for ens, name in zip(ensembl, names):
+        mapped = mapping.get(ens)
+        token = token_dict.get(mapped) if mapped is not None else None
+        if token is None:
+            continue
+        if token not in labels:
+            tokens.append(token)
+            labels[token] = mapped if name is None else name
+        elif ens == mapped and name is not None:
+            labels[token] = name
+    return tokens, labels
+
+
+def gene_embeddings(model_dir: Path, dataset_path: Path, batch_size: int, all_layers: bool,
+                    max_ncells: int = None):
+    """Mean hidden state of each gene token over the cells whose input contains it.
+
+    Runs the model's own forward pass; per layer, the hidden states of the gene tokens
+    (not padding, <cls> or <eos>) are added into a (vocab, d) sum on the model's device,
+    so memory does not grow with the number of cells. hidden_states[0] is the input
+    embedding (gene token + rank position), 1..N the transformer layers; only the last
+    one unless all_layers. max_ncells subsamples as EmbExtractor does (shuffle, seed 42).
+
+    Returns (embs, tokens, n_cells, n_total): embs (n_layers, n_tokens, d) float32 for the
+    tokens seen in at least one cell, their token ids, the number of cells each was
+    averaged over, and the number of cells run.
+    """
+    import pickle
+
+    import torch
+    from datasets import load_from_disk
+    from tqdm.auto import trange
+
+    from geneformer import TOKEN_DICTIONARY_FILE
+    from geneformer import perturber_utils as pu
+
+    with open(TOKEN_DICTIONARY_FILE, "rb") as f:
+        token_dict = pickle.load(f)
+    model = pu.load_model("Pretrained", 0, str(model_dir), mode="eval")
+    device = next(model.parameters()).device
+    pad_id = token_dict["<pad>"]
+    special = torch.tensor([v for k, v in token_dict.items() if k.startswith("<")], device=device)
+
+    data = load_from_disk(str(dataset_path))
+    if max_ncells is not None and len(data) > max_ncells:
+        data = data.shuffle(seed=42).select(range(max_ncells))
+    data = data.sort("length", reverse=True)        # similar lengths per batch: less padding
+
+    n_layers = model.config.num_hidden_layers + 1
+    layers = list(range(n_layers)) if all_layers else [n_layers - 1]
+    sums = torch.zeros(len(layers), model.config.vocab_size, model.config.hidden_size,
+                       dtype=torch.float64, device=device)
+    counts = torch.zeros(model.config.vocab_size, dtype=torch.float64, device=device)
+
+    for start in trange(0, len(data), batch_size, desc="  Gene embeddings"):
+        seqs = data.select(range(start, min(start + batch_size, len(data))))["input_ids"]
+        lengths = torch.tensor([len(s) for s in seqs], device=device)
+        ids = torch.full((len(seqs), int(lengths.max())), pad_id, dtype=torch.long, device=device)
+        for row, seq in enumerate(seqs):
+            ids[row, :len(seq)] = torch.tensor(seq, device=device)
+        attention = torch.arange(ids.shape[1], device=device) < lengths[:, None]
+        with torch.no_grad():
+            hidden = model(input_ids=ids, attention_mask=attention.long()).hidden_states
+        if len(hidden) != n_layers:
+            raise RuntimeError(f"model returned {len(hidden)} hidden states, expected {n_layers}")
+        genes = attention & ~torch.isin(ids, special)
+        flat = ids[genes]
+        counts.index_add_(0, flat, torch.ones(len(flat), dtype=counts.dtype, device=device))
+        for out, layer in enumerate(layers):
+            sums[out].index_add_(0, flat, hidden[layer][genes].to(sums.dtype))
+        del hidden
+
+    seen = torch.nonzero(counts).squeeze(1)
+    embs = (sums[:, seen] / counts[seen, None]).float().cpu().numpy()
+    return embs, seen.cpu().numpy(), counts[seen].long().cpu().numpy(), len(data)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Zero-shot Geneformer embedding extraction",
@@ -160,6 +281,11 @@ def main():
         "--no_gene_embs",
         action="store_true",
         help="Skip gene embedding extraction (saves time/disk for large datasets)",
+    )
+    parser.add_argument(
+        "--no_cell_embs",
+        action="store_true",
+        help="Skip cell embedding extraction (with --cell_type, the full file is then not tokenized)",
     )
     parser.add_argument(
         "--all_layers",
@@ -209,9 +335,20 @@ def main():
         "--save_npz",
         action="store_true",
         help=(
-            "Save gene embeddings as a single .npz file (layer_gene_embs.npz) with key "
-            "'layer_gene_embs', shape (n_layers+1, n_genes, d_model) — same format as scGPT. "
-            "Requires --all_layers. Gene names are written alongside as layer_gene_embs_gene_names.txt."
+            "With --all_layers_cell: also stack the cell embeddings into layer_cell_embs.npz "
+            "(key 'layer_cell_embs', (n_layers+1, n_cells, d_model); cell ids in 'cell_ids'). "
+            "For gene embeddings in .npz use --save_path."
+        ),
+    )
+    parser.add_argument(
+        "--save_path",
+        type=Path,
+        default=None,
+        help=(
+            "Write gene embeddings in scGPT's format instead of CSVs: PATH.npz with key "
+            "'layer_gene_embs', (n_layers, n_genes, d_model) float32 (all n_layers+1 with "
+            "--all_layers, else only the final layer), and 'n_cells' (cells averaged per gene); "
+            "gene names, one per line, in PATH_gene_names.txt."
         ),
     )
     parser.add_argument(
@@ -273,6 +410,12 @@ def main():
         sys.exit(1)
     if not (model_dir / "model.safetensors").exists() and not (model_dir / "Geneformer-V2-316M").exists():
         print(f"WARNING: No model.safetensors found in {model_dir}. Make sure this is the Geneformer repo root.")
+    if args.no_cell_embs and args.no_gene_embs:
+        print("ERROR: --no_cell_embs and --no_gene_embs together leave nothing to extract.")
+        sys.exit(1)
+    if args.save_path is not None and args.no_gene_embs:
+        print("ERROR: --save_path is for gene embeddings; it cannot be combined with --no_gene_embs.")
+        sys.exit(1)
 
     validate_adata(input_path, cell_type=args.cell_type, cell_type_col=args.cell_type_col, var_index=args.var_index)
 
@@ -288,90 +431,96 @@ def main():
         )
         sys.exit(1)
 
-    # Build the Ensembl ID → desired index mapping once, before entering the temp dir.
-    if args.var_index is not None:
-        _var = ad.read_h5ad(input_path, backed="r").var
-        if args.var_index == "var_names":
-            id_to_label = dict(zip(_var["ensembl_id"], _var.index))
-        else:
-            id_to_label = dict(zip(_var["ensembl_id"], _var[args.var_index]))
-        del _var
+    # Token id → output gene label, read once before entering the temp dir.
+    if not args.no_gene_embs:
+        gene_tokens, gene_labels = token_labels(input_path, args.var_index)
+
+    # The full file is tokenized for cell embeddings, and for gene embeddings without --cell_type.
+    tokenize_full = not args.no_cell_embs or (not args.no_gene_embs and args.cell_type is None)
 
     with tempfile.TemporaryDirectory(prefix="geneformer_") as tmpdir:
         tmpdir = Path(tmpdir)
-        data_dir = tmpdir / "input_data"
-        tok_dir = tmpdir / "tokenized"
-        data_dir.mkdir()
-        tok_dir.mkdir()
-
-        # Write h5ad to temp dir with obs_names captured as a column so it
-        # survives tokenization and can be used to align npz rows to cells.
-        print("  Adding cell IDs to temp h5ad...")
-        _adata_tok = ad.read_h5ad(input_path)
-        _adata_tok.obs["__cell_id__"] = _adata_tok.obs_names.astype(str)
-        _adata_tok.write_h5ad(data_dir / input_path.name)
-        del _adata_tok
-
-        # ------------------------------------------------------------------ #
-        # Step 1: Tokenize
-        # ------------------------------------------------------------------ #
-        print("\n[1/3] Tokenizing...")
         tk = TranscriptomeTokenizer(
             custom_attr_name_dict={"__cell_id__": "__cell_id__"},
             nproc=args.nproc,
             model_version="V2",
         )
-        tk.tokenize_data(
-            data_directory=data_dir,
-            output_directory=tok_dir,
-            output_prefix="dataset",
-            file_format="h5ad",
-        )
-        dataset_path = tok_dir / "dataset.dataset"
-        print(f"  Tokenized dataset saved to: {dataset_path}")
+
+        # ------------------------------------------------------------------ #
+        # Step 1: Tokenize
+        # ------------------------------------------------------------------ #
+        if tokenize_full:
+            data_dir = tmpdir / "input_data"
+            tok_dir = tmpdir / "tokenized"
+            data_dir.mkdir()
+            tok_dir.mkdir()
+
+            # Write h5ad to temp dir with obs_names captured as a column so it
+            # survives tokenization and can be used to align npz rows to cells.
+            print("  Adding cell IDs to temp h5ad...")
+            _adata_tok = ad.read_h5ad(input_path)
+            _adata_tok.obs["__cell_id__"] = _adata_tok.obs_names.astype(str)
+            _adata_tok.write_h5ad(data_dir / input_path.name)
+            del _adata_tok
+
+            print("\n[1/3] Tokenizing...")
+            tk.tokenize_data(
+                data_directory=data_dir,
+                output_directory=tok_dir,
+                output_prefix="dataset",
+                file_format="h5ad",
+            )
+            dataset_path = tok_dir / "dataset.dataset"
+            print(f"  Tokenized dataset saved to: {dataset_path}")
+        else:
+            print("\n[1/3] Skipping tokenization of the full file (--no_cell_embs with --cell_type).")
 
         # ------------------------------------------------------------------ #
         # Step 2: Cell embeddings (mean-pool of gene embeddings per cell)
         # ------------------------------------------------------------------ #
-        cell_layer_desc = "all layers" if args.all_layers_cell else "final layer"
-        print(f"\n[2/3] Extracting cell embeddings (mean-pool, {cell_layer_desc})...")
-        cell_embex = EmbExtractor(
-            model_type="Pretrained",
-            emb_mode="cell",
-            emb_label=["__cell_id__"],
-            emb_layer="all" if args.all_layers_cell else 0,
-            forward_batch_size=args.batch_size,
-            max_ncells=max_ncells,
-            nproc=args.nproc,
-            summary_stat=None,
-        )
-        cell_embs = cell_embex.extract_embs(
-            model_directory=str(model_dir),
-            input_data_file=str(dataset_path),
-            output_directory=str(output_dir),
-            output_prefix="cell_embeddings",
-        )
-        if args.all_layers_cell:
-            print(f"  Done: {len(cell_embs)} layers → {output_dir}/cell_embeddings_layer*.csv")
-            if args.save_npz:
-                layers = sorted(cell_embs.keys())
-                emb_cols = cell_embs[layers[0]].select_dtypes(include="number").columns
-                arr = np.stack([cell_embs[l][emb_cols].values for l in layers], axis=0)
-                cell_ids = cell_embs[layers[0]]["__cell_id__"].tolist()
-                npz_path = output_dir / "layer_cell_embs.npz"
-                np.savez(npz_path, layer_cell_embs=arr, cell_ids=np.array(cell_ids))
-                print(f"  Saved .npz → {npz_path}  shape {arr.shape}")
-                print(f"  Cell IDs saved as 'cell_ids' key in npz")
+        if not args.no_cell_embs:
+            cell_layer_desc = "all layers" if args.all_layers_cell else "final layer"
+            print(f"\n[2/3] Extracting cell embeddings (mean-pool, {cell_layer_desc})...")
+            cell_embex = EmbExtractor(
+                model_type="Pretrained",
+                emb_mode="cell",
+                emb_label=["__cell_id__"],
+                emb_layer="all" if args.all_layers_cell else 0,
+                forward_batch_size=args.batch_size,
+                max_ncells=max_ncells,
+                nproc=args.nproc,
+                summary_stat=None,
+            )
+            cell_embs = cell_embex.extract_embs(
+                model_directory=str(model_dir),
+                input_data_file=str(dataset_path),
+                output_directory=str(output_dir),
+                output_prefix="cell_embeddings",
+            )
+            if args.all_layers_cell:
+                print(f"  Done: {len(cell_embs)} layers → {output_dir}/cell_embeddings_layer*.csv")
+                if args.save_npz:
+                    layers = sorted(cell_embs.keys())
+                    emb_cols = cell_embs[layers[0]].select_dtypes(include="number").columns
+                    arr = np.stack([cell_embs[l][emb_cols].values for l in layers], axis=0)
+                    cell_ids = cell_embs[layers[0]]["__cell_id__"].tolist()
+                    npz_path = output_dir / "layer_cell_embs.npz"
+                    np.savez(npz_path, layer_cell_embs=arr, cell_ids=np.array(cell_ids))
+                    print(f"  Saved .npz → {npz_path}  shape {arr.shape}")
+                    print(f"  Cell IDs saved as 'cell_ids' key in npz")
+            else:
+                n_cells_out = len(cell_embs)
+                n_dims = len([c for c in cell_embs.columns if str(c).isdigit()])
+                print(f"  Done: {n_cells_out} cells x {n_dims} dims → {output_dir}/cell_embeddings.csv")
         else:
-            n_cells_out = len(cell_embs)
-            n_dims = len([c for c in cell_embs.columns if str(c).isdigit()])
-            print(f"  Done: {n_cells_out} cells x {n_dims} dims → {output_dir}/cell_embeddings.csv")
+            print("\n[2/3] Skipping cell embeddings (--no_cell_embs set).")
 
         # ------------------------------------------------------------------ #
-        # Step 3: Gene embeddings (contextual token embeddings, per cell)
+        # Step 3: Gene embeddings (contextual token embeddings, mean over cells)
         # ------------------------------------------------------------------ #
         if not args.no_gene_embs:
             # If a cell type filter is requested, subset the data and re-tokenize.
+            min_cells = 1
             if args.cell_type is not None:
                 print(f"\n  Filtering to cell type '{args.cell_type}' for gene embeddings...")
                 adata_full = ad.read_h5ad(input_path)
@@ -410,68 +559,59 @@ def main():
             layer_desc = "all layers" if args.all_layers else "final layer"
             ct_desc = f", cell type='{args.cell_type}'" if args.cell_type else ""
             print(f"\n[3/3] Extracting gene embeddings (contextual, {layer_desc}{ct_desc})...")
-            gene_embex = EmbExtractor(
-                model_type="Pretrained",
-                emb_mode="gene",
-                gene_emb_style="mean_pool",
-                emb_layer="all" if args.all_layers else 0,
-                forward_batch_size=args.batch_size,
-                max_ncells=max_ncells,
-                nproc=args.nproc,
-                summary_stat=None,
-            )
-            gene_embs = gene_embex.extract_embs(
-                model_directory=str(model_dir),
-                input_data_file=str(gene_dataset_path),
-                output_directory=str(output_dir),
-                output_prefix="gene_embeddings",
-            )
+            embs, seen, n_cells, n_run = gene_embeddings(
+                model_dir, gene_dataset_path, args.batch_size, args.all_layers, max_ncells)
 
-            # Remap Ensembl ID index to the requested var column / var_names and re-save.
-            if args.var_index is not None:
-                if args.all_layers:
-                    n_layers = len(gene_embs)
-                    pad_width = len(str(n_layers - 1))
-                    for layer_key in sorted(gene_embs.keys()):
-                        df = gene_embs[layer_key]
-                        df.index = [id_to_label.get(g, g) for g in df.index]
-                        df.to_csv(output_dir / f"gene_embeddings_layer{str(layer_key).zfill(pad_width)}.csv")
-                else:
-                    gene_embs.index = [id_to_label.get(g, g) for g in gene_embs.index]
-                    gene_embs.to_csv(output_dir / "gene_embeddings.csv")
+            # Genes in adata.var order; a gene must be in the input of min(10, n) cells, which
+            # the expression filter above already ensures unless the 4096-token cut dropped it.
+            row = {int(t): i for i, t in enumerate(seen)}
+            if args.cell_type is not None:
+                min_cells = min(10, n_run)
+            kept = [t for t in gene_tokens if t in row and n_cells[row[t]] >= min_cells]
+            n_short = sum(1 for t in gene_tokens if t in row and n_cells[row[t]] < min_cells)
+            if n_short:
+                print(f"  {n_short} genes in fewer than {min_cells} cells' inputs (4096-token cut) dropped")
+            if len(row) != sum(1 for t in gene_tokens if t in row):
+                raise RuntimeError("tokens in the model input that are not genes of adata.var")
+            embs = embs[:, [row[t] for t in kept]]
+            n_cells = n_cells[[row[t] for t in kept]]
+            names = [str(gene_labels[t]) for t in kept]
+            print(f"  {len(names)} genes x {embs.shape[0]} layers x {embs.shape[2]} dims "
+                  f"from {n_run} cells (cells per gene: median {int(np.median(n_cells))})")
 
-            # Save as stacked .npz matching scGPT's layer_gene_embs format.
-            if args.save_npz:
-                if not args.all_layers:
-                    print("  WARNING: --save_npz requires --all_layers; skipping .npz output.")
-                else:
-                    layers = sorted(gene_embs.keys())
-                    arr = np.stack([gene_embs[l].values for l in layers], axis=0)
-                    gene_names = gene_embs[layers[0]].index.tolist()
-                    npz_path = output_dir / "layer_gene_embs.npz"
-                    np.savez(npz_path, layer_gene_embs=arr)
-                    names_path = output_dir / "layer_gene_embs_gene_names.txt"
-                    names_path.write_text("\n".join(gene_names))
-                    print(f"  Saved .npz → {npz_path}  shape {arr.shape}")
-                    print(f"  Gene names → {names_path}")
-
-            if args.all_layers:
-                print(f"  Done: {len(gene_embs)} layers → {output_dir}/gene_embeddings_layer*.csv")
+            if args.save_path is not None:
+                save_path = args.save_path.expanduser().resolve()
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                npz_path = save_path.with_name(save_path.name + ".npz")
+                np.savez(npz_path, layer_gene_embs=embs, n_cells=n_cells)
+                names_path = save_path.with_name(save_path.name + "_gene_names.txt")
+                names_path.write_text("\n".join(names))
+                print(f"  Saved .npz → {npz_path}  layer_gene_embs {embs.shape}")
+                print(f"  Gene names → {names_path}")
+            elif args.all_layers:
+                pad_width = len(str(embs.shape[0] - 1))
+                for layer in range(embs.shape[0]):
+                    pd.DataFrame(embs[layer], index=names).to_csv(
+                        output_dir / f"gene_embeddings_layer{str(layer).zfill(pad_width)}.csv")
+                print(f"  Done: {embs.shape[0]} layers → {output_dir}/gene_embeddings_layer*.csv")
             else:
-                print(f"  Done: {len(gene_embs)} rows → {output_dir}/gene_embeddings.csv")
+                pd.DataFrame(embs[0], index=names).to_csv(output_dir / "gene_embeddings.csv")
+                print(f"  Done: {len(names)} rows → {output_dir}/gene_embeddings.csv")
         else:
             print("\n[3/3] Skipping gene embeddings (--no_gene_embs set).")
 
     print(f"\nAll embeddings written to: {output_dir}/")
-    if args.all_layers_cell:
-        print("  cell_embeddings_layer{N}.csv — one file per layer (layer 0 = embedding, 1–N = transformer)")
-    else:
-        print("  cell_embeddings.csv — shape (N_cells, 1152)")
-    if not args.no_gene_embs:
-        if args.all_layers:
-            print("  gene_embeddings_layer{N}.csv — one file per layer (layer 0 = embedding, 1–N = transformer)")
+    if not args.no_cell_embs:
+        if args.all_layers_cell:
+            print("  cell_embeddings_layer{N}.csv — one file per layer (layer 0 = embedding, 1–N = transformer)")
         else:
-            print("  gene_embeddings.csv — shape (N_genes, 1152), indexed by Ensembl ID")
+            print("  cell_embeddings.csv — shape (N_cells, 1152)")
+    if not args.no_gene_embs and args.save_path is None:
+        index_desc = "Ensembl ID" if args.var_index is None else args.var_index
+        if args.all_layers:
+            print(f"  gene_embeddings_layer{{N}}.csv — one file per layer (layer 0 = embedding, 1–N = transformer), indexed by {index_desc}")
+        else:
+            print(f"  gene_embeddings.csv — shape (N_genes, 1152), indexed by {index_desc}")
 
 
 if __name__ == "__main__":
