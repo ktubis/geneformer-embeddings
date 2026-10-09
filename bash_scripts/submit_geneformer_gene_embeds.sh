@@ -18,13 +18,15 @@
 # The jobs run this checkout's extract_embeddings.py and geneformer package inside
 # geneformer_amd64.sif (the environment), so a code change needs only a pull. The
 # checkout must be clean: its commit is written at the top of every job log. The
-# weights (model.safetensors, config.json) and token dictionaries (geneformer/*.pkl)
-# are gitignored and must be copied into it once.
+# model (MODEL_SUBDIR/: model.safetensors, config.json, from huggingface.co/ctheodoris/
+# Geneformer) and the token dictionaries (geneformer/*.pkl) are gitignored and must be
+# copied into it once.
 
 set -uo pipefail
 
 # ── Paths (host-side) ──────────────────────────────────────────────────────────
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"       # this checkout, bound to /mnt
+MODEL_SUBDIR="Geneformer-V2-316M"                              # the model, in the checkout
 HOST_DATA="/cluster/work/boeva/ktubis/data"                    # bound to /data
 DATA_DIR="${HOST_DATA}/final_datasets"
 OUT_BASE="gene_embeddings"
@@ -58,18 +60,19 @@ if [[ -n "$(git -C "$REPO" status --porcelain -- extract_embeddings.py geneforme
     exit 1
 fi
 MISSING=()
-for f in model.safetensors config.json; do
-    [[ -f "${REPO}/${f}" ]] || MISSING+=("${f}")
-done
+# git-lfs pointers are ~130-byte text files: the weights must be the real ~1.3 GB file,
+# a dictionary a real pickle (first byte 0x80)
+p="${MODEL_SUBDIR}/model.safetensors"
+[[ -f "${REPO}/${p}" && $(wc -c < "${REPO}/${p}") -gt 1000000 ]] || MISSING+=("${p}")
+[[ -f "${REPO}/${MODEL_SUBDIR}/config.json" ]] || MISSING+=("${MODEL_SUBDIR}/config.json")
 for f in token_dictionary gene_median_dictionary ensembl_mapping_dict gene_name_id_dict; do
     p="geneformer/${f}_gc104M.pkl"
-    # a real pickle starts with byte 0x80; a git-lfs pointer is a short text file
     [[ -f "${REPO}/${p}" && "$(head -c1 "${REPO}/${p}" | od -An -tx1 | tr -d ' ')" == "80" ]] \
         || MISSING+=("${p}")
 done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
-    echo "error: missing in ${REPO} (gitignored, copy them in once, e.g. from a" >&2
-    echo "Geneformer V2-316M clone of huggingface.co/ctheodoris/Geneformer):" >&2
+    echo "error: missing in ${REPO}, or git-lfs pointers instead of the files (gitignored;" >&2
+    echo "copy them in once from a clone of huggingface.co/ctheodoris/Geneformer):" >&2
     printf '  %s\n' "${MISSING[@]}" >&2
     exit 1
 fi
@@ -168,7 +171,7 @@ PYEOF
                 --wrap="echo 'geneformer code: ${CODE_COMMIT}'; ${SIF_RUN} python /mnt/extract_embeddings.py \
                     --input '${DATA_PATH_CONTAINER}' \
                     --output_dir '${OUTPUT_DIR_CONTAINER}' \
-                    --model_dir /mnt \
+                    --model_dir '/mnt/${MODEL_SUBDIR}' \
                     --cell_type '${CELLTYPE}' \
                     --cell_type_col '${COL}' \
                     --no_cell_embs \

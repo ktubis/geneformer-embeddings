@@ -12,9 +12,10 @@ dist/
 .ipynb_checkpoints/
 .DS_Store
 
-# model files, copied in once (see bash_scripts/submit_geneformer_gene_embeds.sh)
+# the model (Geneformer-*/) and its config files, copied in once (see bash_scripts/submit_geneformer_gene_embeds.sh)
 /config.json
 /generation_config.json
+/Geneformer-*/
 
 # outputs and job logs of bash_scripts/
 gene_embeddings*/
