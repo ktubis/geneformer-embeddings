@@ -203,6 +203,7 @@ def gene_embeddings(model_dir: Path, dataset_path: Path, batch_size: int, all_la
         token_dict = pickle.load(f)
     model = pu.load_model("Pretrained", 0, str(model_dir), mode="eval")
     device = next(model.parameters()).device
+    print(f"  device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
     pad_id = token_dict["<pad>"]
     special = torch.tensor([v for k, v in token_dict.items() if k.startswith("<")], device=device)
 
@@ -235,6 +236,8 @@ def gene_embeddings(model_dir: Path, dataset_path: Path, batch_size: int, all_la
             sums[out].index_add_(0, flat, hidden[layer][genes].to(sums.dtype))
         del hidden
 
+    if device.type == "cuda":
+        print(f"  peak GPU memory: {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GiB")
     seen = torch.nonzero(counts).squeeze(1)
     embs = (sums[:, seen] / counts[seen, None]).float().cpu().numpy()
     return embs, seen.cpu().numpy(), counts[seen].long().cpu().numpy(), len(data)
@@ -395,6 +398,13 @@ def main():
                     kwargs["device"] = "cpu"
                 return _orig_t_to(self, *args, **kwargs)
             torch.Tensor.to = _safe_t_to
+    else:
+        import torch
+        if not torch.cuda.is_available():
+            # The gene embeddings would otherwise run on the CPU, unnoticed and for hours.
+            print("ERROR: no CUDA GPU visible (with singularity, pass --nv). "
+                  "--allow_cpu runs on the CPU, for testing only.")
+            sys.exit(1)
 
     input_path = args.input.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
