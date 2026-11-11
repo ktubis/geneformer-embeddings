@@ -233,6 +233,41 @@ def test_main_on_synthetic_sites(tmp_path, model_dir, token_dict):
     assert (r["n_heldout"] > 0).all()
     pr = r["pred_rank"] / r["n_heldout"]
     assert ((pr >= 0) & (pr <= 1)).all()
+    assert r["cls"].shape == (len(conds), 50, 16) and list(r["cls_conditions"]) == conds
     with pytest.raises(SystemExit):                                  # never overwrites
         oi.main(["--data-dir", str(tmp_path), "--batch-pairs", "s1_3p:s1_5p", "--celltypes",
                  "T cell", "--layers", "1", "--model-dir", str(model_dir), "--out", str(out)])
+
+
+def test_staged_run_equals_one_job(tmp_path, model_dir, token_dict):
+    with open(GENE_MEDIAN_FILE, "rb") as f:
+        medians = pickle.load(f)
+    ens = [k for k in token_dict if not k.startswith("<") and k in medians][:40]
+    rng = np.random.default_rng(2)
+    for chem, sh in (("3p", 0.0), ("5p", 1.0)):
+        X = rng.poisson(1.5 + sh * (np.arange(40) % 3 == 0), size=(45, 40)).astype(np.float32)
+        a = ad.AnnData(X)
+        a.var_names = [f"G{i}" for i in range(40)]
+        a.var["ensembl_id"] = ens
+        a.obs_names = [f"{chem}_{i}" for i in range(45)]
+        a.obs["celltype_coarse"] = ["T cell"] * 25 + ["B cell"] * 20
+        a.write_h5ad(tmp_path / f"s1_{chem}.h5ad")
+    run = ["--data-dir", str(tmp_path), "--batch-pairs", "s1_3p:s1_5p", "--celltypes", "T cell",
+           "B cell", "--celltype-pairs", "T cell:B cell", "--layers", "0", "2", "--n-random", "1",
+           "--doses", "2", "--nproc", "1", "--device", "cpu", "--model-dir", str(model_dir),
+           "--cls-cells", "12", "--chunk-size", "10"]
+    one, staged = tmp_path / "one", tmp_path / "staged"
+    oi.main(run + ["--out", str(one)])
+    oi.main(run + ["--out", str(staged), "--stage", "shifts"])
+    tasks = oi.read_tasks(staged)
+    assert len(tasks) == 3 + 2 + 3 + 2
+    for t in range(len(tasks) + 1):
+        oi.main(run + ["--out", str(staged), "--stage", "eval", "--task", str(t)])
+    oi.main(["--out", str(staged), "--stage", "merge"])
+    for f in ("s1_3p__T_cell.npz", "s1_5p__B_cell.npz"):
+        a, b = np.load(one / f), np.load(staged / f)
+        assert list(a["conditions"]) == list(b["conditions"])
+        assert np.array_equal(a["token_ids"], b["token_ids"])
+        for k in ("n_heldout", "target_sum", "pred_rank", "p_correct", "cls", "cls_cells"):
+            assert np.allclose(a[k], b[k], atol=1e-4), k
+        assert a["cls"].shape[1] == 12 and np.abs(a["cls"][0]).sum() > 0

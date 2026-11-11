@@ -69,12 +69,23 @@ rand_ct<i>|a>b. "base" is the unshifted model.
         --celltype-pairs "T cell:B cell" --layers 0 1 9 17 18 \\
         --model-dir Geneformer-V2-316M --out offset_runs/pilot
 
-Writes <out>/<batch>__<celltype>.npz per instance: genes (n,) the gene names
+Stages (--stage), as in the scGPT script, so that every cell can be used (no cap
+by default): shifts (one job: the estimation pass over every cell; shifts.npz,
+plan.pt, tasks.tsv, labels.json), eval (one job per task = an instance's chunk
+of --chunk-size cells, --task or $SLURM_ARRAY_TASK_ID; parts/...), merge (CPU:
+adds the parts up), all (the three in one job; the default). Every random choice
+of an instance (subsample, masked positions, <cls> cells) is drawn from a seed
+of its own, so every job prepares it the same way.
+
+<out>/<batch>__<celltype>.npz per instance: genes (n,) the gene names
 (adata.var_names), token_ids (n,), n_heldout (n,) how often each gene was masked
 over the instance's cells, target_sum (n,) the sum of its true relative ranks
 there, conditions (c,) ("base" or "L<layer>|ctx|<shift>" / "L<layer>|dir|<shift>"),
-and per read-out the sums over the cells per condition: pred_rank, p_correct,
-logp_correct, top1 (c, n); and <out>/shifts.npz with the same keys as the scGPT
+per read-out the sums over the cells per condition: pred_rank, p_correct,
+logp_correct, top1 (c, n); cls_conditions (c,) and cls (c, m, d) float16, the
+final <cls> output of --cls-cells random cells per condition (<cls> sees the
+masked tokens, so dir passes have their own), cls_cells (m,) their indices among
+the instance's cells; and <out>/shifts.npz with the same keys as the scGPT
 script's: keys, n_cells, n_genes, n_genes_median (genes per cell's input),
 chem_own_keys / chem_own / chem_own_n_shared, chem_heldout_keys / chem_heldout /
 chem_heldout_n, ct_own_*, ct_heldout_*, layers, heldout_ratio.
@@ -82,11 +93,14 @@ chem_heldout_n, ct_own_*, ct_heldout_*, layers, heldout_ratio.
 
 import argparse
 import fnmatch
+import json
 import os
 import pickle
 import sys
 import tempfile
+import zlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import anndata as ad
 import numpy as np
@@ -120,10 +134,22 @@ def resolve_batches(specs, names, data_dir):
     return out
 
 
+def celltype_labels(specs):
+    """{instance celltype: set of obs labels} from --celltypes entries NAME or
+    NAME=LABEL1,LABEL2 (cells with any of the labels form the instance NAME, e.g.
+    "PP=gamma,pp" where datasets name a celltype differently)."""
+    out = {}
+    for spec in specs:
+        name, sep, labels = spec.partition("=")
+        out[name] = set(labels.split(",")) if sep else {name}
+    return out
+
+
 def pool_celltypes(paths, celltypes, col):
-    """{celltype: AnnData of its cells pooled over the files (shared genes, their
+    """{name: AnnData of its cells pooled over the files (shared genes, their
     var columns kept where the files agree)}; obs["n_counts"] = X's row sums where
-    a file has none."""
+    a file has none;
+    for celltypes = {name: set of obs labels} (celltype_labels)."""
     parts = {ct: [] for ct in celltypes}
     for path in paths:
         adata = ad.read_h5ad(path)
@@ -134,7 +160,7 @@ def pool_celltypes(paths, celltypes, col):
             adata.obs["n_counts"] = np.asarray(adata.X.sum(axis=1)).ravel().astype(np.float64)
         labels = adata.obs[col].astype(str)
         for ct in celltypes:
-            mask = (labels == ct).to_numpy()
+            mask = labels.isin(celltypes[ct]).to_numpy()
             if mask.any():
                 parts[ct].append(adata[mask].copy())
         del adata
@@ -307,17 +333,24 @@ def readout(model, h, ids, genes, is_masked, masked, acc):
 
 
 @torch.no_grad()
-def predict_all(model, seqs, masked, conditions, batch_size, device, special, pad_id, mask_id):
+def predict_all(model, seqs, masked, conditions, batch_size, device, special, pad_id, mask_id,
+                cls_rows=None):
     """Every condition on the same masked positions: (c, 6, vocab) float32 sums over
     the cells where each gene was masked of (1, true relative rank, pred_rank,
     p_correct, logp_correct, top1). conditions: [(shift or None, shift_masked)];
     shift = (layer, vec) adds vec at that layer's output to the unmasked gene tokens,
     and to the masked ones if shift_masked. Each batch runs the unshifted pass once,
     keeping every layer's states; a condition shifted at layer L starts from the
-    states at L."""
+    states at L. With cls_rows (indices into the cells), also returns the final <cls>
+    output (position 0) of those cells per condition, (c, rows, d) float16 (masked
+    tokens are seen by <cls> here, so dir passes have their own)."""
     acc = torch.zeros(len(conditions), 6, model.config.vocab_size, device=device)
     special_t = torch.tensor(sorted(special), device=device)
+    rows = [] if cls_rows is None else sorted(int(r) for r in cls_rows)
+    where_row = {r: i for i, r in enumerate(rows)}
+    cls = torch.zeros(len(conditions), len(rows), model.config.hidden_size, dtype=torch.float16)
     for s in batches(len(seqs), batch_size):
+        keep = [(i, where_row[r]) for i, r in enumerate(range(s.start, s.stop)) if r in where_row]
         ids, att = (x.to(device) for x in pad(seqs[s], pad_id))
         is_masked = torch.zeros_like(att)
         for i, P in enumerate(masked[s]):
@@ -335,7 +368,10 @@ def predict_all(model, seqs, masked, conditions, batch_size, device, special, pa
                 h = run_layers(model, states[L], att, start=L,
                                shift=(L, vec.to(device), where))[-1]
             readout(model, h, ids, genes, is_masked, masked[s], acc[c])
-    return acc.cpu()
+            if keep:
+                bi, ci = zip(*keep)
+                cls[c, list(ci)] = h[list(bi), 0].half().cpu()
+    return acc.cpu() if cls_rows is None else (acc.cpu(), cls)
 
 
 def predict(model, seqs, masked, batch_size, device, special, pad_id, mask_id, shift=None,
@@ -460,10 +496,25 @@ def safe(name):
     return name.replace(" ", "_").replace("/", "-")
 
 
+def instance_seed(seed, key):
+    """A seed of its own per instance (batch, celltype), the same in every job."""
+    return zlib.crc32(f"{seed}|{key[0]}|{key[1]}".encode())
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", required=True)
+    p.add_argument("--stage", choices=["all", "shifts", "eval", "merge"], default="all",
+                   help="all: everything in this job; or shifts (one job), eval (one job "
+                        "per task: an instance's chunk of cells), merge (CPU)")
+    p.add_argument("--task", type=int, default=None,
+                   help="eval: the task index (default $SLURM_ARRAY_TASK_ID); tasks past "
+                        "the last exit")
+    p.add_argument("--chunk-size", type=int, default=1000, help="cells per eval task")
+    p.add_argument("--cls-cells", type=int, default=1000,
+                   help="per instance, the cells whose final <cls> output is saved for "
+                        "every condition (a random subset; 0: none)")
+    p.add_argument("--data-dir")
     p.add_argument("--batch", action="append", default=[], metavar="NAME=PATTERN[,PATTERN]",
                    help="a batch made of the h5ad files matching the patterns (names "
                         "without .h5ad, globs allowed), pooled; repeatable. Any other "
@@ -472,12 +523,14 @@ def parse_args(argv=None):
                    help="batch pairs A:B; the chemistry shift moves A to B")
     p.add_argument("--datasets", nargs="+", default=[],
                    help="further batches (default: those of --batch-pairs)")
-    p.add_argument("--celltypes", nargs="+", required=True)
+    p.add_argument("--celltypes", nargs="+", default=[],
+                   help="NAME, or NAME=LABEL1,LABEL2 to pool differently named cells")
     p.add_argument("--celltype-col", default="celltype_coarse")
     p.add_argument("--celltype-pairs", nargs="+", default=[], help="a:b, the shift moves a to b")
-    p.add_argument("--layers", type=int, nargs="+", required=True,
+    p.add_argument("--layers", type=int, nargs="+", default=[],
                    help="layers whose output gets the shift (0 = embedding output .. n)")
-    p.add_argument("--max-cells", type=int, default=400, help="per instance, drawn at random")
+    p.add_argument("--max-cells", type=int, default=0,
+                   help="per instance, drawn at random (0: every cell)")
     p.add_argument("--min-cells", type=int, default=20)
     p.add_argument("--heldout-ratio", type=float, default=0.15)
     p.add_argument("--doses", type=float, nargs="*", default=[0.5, 2.0])
@@ -486,24 +539,20 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--nproc", type=int, default=4, help="tokenizer processes")
     p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
-    p.add_argument("--model-dir", required=True,
+    p.add_argument("--model-dir",
                    help="the pretrained BertForMaskedLM (model.safetensors, config.json)")
     p.add_argument("--out", required=True)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.stage != "merge":
+        missing = [f"--{k.replace('_', '-')}" for k in ("data_dir", "model_dir")
+                   if getattr(args, k) is None] + (["--celltypes"] if not args.celltypes else [])
+        if missing:
+            p.error(f"--stage {args.stage} needs {' '.join(missing)}")
+    return args
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    batch_pairs = parse_pairs(args.batch_pairs)
-    ct_pairs = parse_pairs(args.celltype_pairs)
-    names = list(dict.fromkeys([d for pr in batch_pairs for d in pr] + args.datasets))
-    if not names:
-        raise ValueError("no batches: give --batch-pairs or --datasets")
-    out = Path(args.out)
-    if out.exists() and any(out.glob("*.npz")):
-        raise SystemExit(f"error: {out} already holds results; give a new --out")
-    batch_files = resolve_batches(args.batch, names, args.data_dir)
-
+def setup(args):
+    """The model and everything the stages share, as a namespace."""
     from geneformer import TOKEN_DICTIONARY_FILE
     from geneformer import perturber_utils as pu
 
@@ -512,28 +561,46 @@ def main(argv=None):
                           else "mps" if torch.backends.mps.is_available() else "cpu")
     with open(TOKEN_DICTIONARY_FILE, "rb") as f:
         token_dict = pickle.load(f)
-    special = {v for k, v in token_dict.items() if k.startswith("<")}
-    pad_id, mask_id = token_dict["<pad>"], token_dict["<mask>"]
-    model = pu.load_model("Pretrained", 0, str(args.model_dir), mode="eval").to(device)
-    n_layers = len(model.bert.encoder.layer)
-    bad = [L for L in args.layers if not 0 <= L <= n_layers]
+    e = SimpleNamespace(device=device)
+    e.special = {v for k, v in token_dict.items() if k.startswith("<")}
+    e.pad_id, e.mask_id = token_dict["<pad>"], token_dict["<mask>"]
+    e.model = pu.load_model("Pretrained", 0, str(args.model_dir), mode="eval").to(device)
+    e.n_layers = len(e.model.bert.encoder.layer)
+    bad = [L for L in args.layers if not 0 <= L <= e.n_layers]
     if bad:
-        raise ValueError(f"--layers {bad}: shifts go at layers 0..{n_layers}")
-    out.mkdir(parents=True, exist_ok=True)
-    print(f"device {device}; {n_layers} layers; held-out ratio {args.heldout_ratio}", flush=True)
+        raise ValueError(f"--layers {bad}: shifts go at layers 0..{e.n_layers}")
+    print(f"device {device}; {e.n_layers} layers; held-out ratio {args.heldout_ratio}",
+          flush=True)
+    return e
 
-    rng = np.random.default_rng(args.seed)
+
+def run_names(args):
+    names = list(dict.fromkeys([d for pr in parse_pairs(args.batch_pairs) for d in pr]
+                               + args.datasets))
+    if not names:
+        raise ValueError("no batches: give --batch-pairs or --datasets")
+    return names
+
+
+def load_instances(args, e, only=None):
+    """(keys, {key: input_ids per cell}, {token id: gene name}) for every (batch,
+    celltype) of the run with at least --min-cells cells, or only for the key `only`."""
+    names = run_names(args) if only is None else [only[0]]
+    files = resolve_batches(args.batch, names, args.data_dir)
     keys, seqs, labels = [], {}, {}
     with tempfile.TemporaryDirectory(prefix="gf_offset_") as tmp:
         for b in names:
-            print(f"{b}: {len(batch_files[b])} file(s)", flush=True)
-            pooled = pool_celltypes(batch_files[b], args.celltypes, args.celltype_col)
-            for ct in args.celltypes:
+            labels_of = celltype_labels(args.celltypes)
+            cts = list(labels_of) if only is None else [only[1]]
+            print(f"{b}: {len(files[b])} file(s)", flush=True)
+            pooled = pool_celltypes(files[b], {c: labels_of[c] for c in cts}, args.celltype_col)
+            for ct in cts:
                 if ct not in pooled:
                     print(f"  {b} / {ct}: not in the batch, skipped", flush=True)
                     continue
                 a = filter_genes_by_prevalence(pooled.pop(ct))
                 if args.max_cells and a.n_obs > args.max_cells:
+                    rng = np.random.default_rng(instance_seed(args.seed, (b, ct)))
                     a = a[np.sort(rng.choice(a.n_obs, args.max_cells, replace=False))].copy()
                 if a.n_obs < args.min_cells:
                     print(f"  {b} / {ct}: {a.n_obs} cells < --min-cells, skipped", flush=True)
@@ -542,53 +609,154 @@ def main(argv=None):
                 labels.update(lab)
                 seqs[(b, ct)] = s
                 keys.append((b, ct))
-                lengths = [sum(t not in special for t in x) for x in s]
+                lengths = [sum(t not in e.special for t in x) for x in s]
                 print(f"  {b} / {ct}: {len(s)} cells; median {np.median(lengths):.0f} genes "
                       "per input", flush=True)
             del pooled
+    return keys, seqs, labels
+
+
+def stage_shifts(args, e, out):
+    """The estimation pass over every cell of every instance: shifts.npz, plan.pt (the
+    shifts each instance gets, random ones included), tasks.tsv (one eval task per
+    instance and chunk of cells) and labels.json (token id -> gene name)."""
+    keys, seqs, labels = load_instances(args, e)
     if not keys:
         raise SystemExit("error: no instance has enough cells")
-
-    emb = {k: gene_means(model, seqs[k], special, args.batch_size, device, pad_id) for k in keys}
-    shifts = pair_shifts(keys, emb, batch_pairs, ct_pairs)
+    emb = {k: gene_means(e.model, seqs[k], e.special, args.batch_size, e.device, e.pad_id)
+           for k in keys}
+    shifts = pair_shifts(keys, emb, parse_pairs(args.batch_pairs), parse_pairs(args.celltype_pairs))
     E = emb[keys[0]][1]
     np.savez(out / "shifts.npz", keys=np.array(["|".join(k) for k in keys]),
              n_cells=np.array([len(seqs[k]) for k in keys]),
              n_genes=np.array([len(emb[k][0]) for k in keys]),
-             n_genes_median=np.array([np.median([sum(t not in special for t in x)
+             n_genes_median=np.array([np.median([sum(t not in e.special for t in x)
                                                  for x in seqs[k]]) for k in keys]),
              layers=np.array(args.layers), heldout_ratio=np.array(args.heldout_ratio),
              **stack_shifts(shifts, (E.shape[0], E.shape[2])))
-    del emb
     plan = plan_shifts(keys, shifts, args.doses, args.n_random, args.seed)
+    torch.save({"|".join(k): v for k, v in plan.items()}, out / "plan.pt")
+    with open(out / "labels.json", "w") as f:
+        json.dump({str(k): str(v) for k, v in labels.items()}, f)
+    with open(out / "tasks.tsv", "w") as f:
+        f.write("task\tbatch\tcelltype\tstart\tstop\n")
+        t = 0
+        for k in keys:
+            n = len(seqs[k])
+            for start in range(0, n, args.chunk_size):
+                f.write(f"{t}\t{k[0]}\t{k[1]}\t{start}\t{min(n, start + args.chunk_size)}\n")
+                t += 1
+    print(f"shifts of {len(keys)} instances; {t} eval tasks -> {out / 'tasks.tsv'}", flush=True)
+    return t
 
-    for k in keys:
-        masked = mask_positions(seqs[k], args.heldout_ratio, special, rng)
-        if k == keys[0]:
-            ids, att = (x.to(device) for x in pad(seqs[k][:args.batch_size], pad_id))
-            print(f"  manual layer pass vs the model's forward: max |diff| "
-                  f"{check_layers(model, ids, att):.1e}", flush=True)
-        conds, todo = ["base"], [(None, False)]
-        for L in args.layers:
-            for name, D in plan[k]:
-                if L < n_layers:
-                    conds.append(f"L{L}|ctx|{name}")
-                    todo.append(((L, D[L]), False))
-                if L >= 1:
-                    conds.append(f"L{L}|dir|{name}")
-                    todo.append(((L, D[L]), True))
-        A = predict_all(model, seqs[k], masked, todo, args.batch_size, device, special, pad_id,
-                        mask_id)
-        base = A[0]
-        hit = torch.nonzero(base[0]).ravel()
-        A = A[:, :, hit].numpy()                                  # (c, 6, n)
-        np.savez(out / f"{safe(k[0])}__{safe(k[1])}.npz",
-                 genes=np.array([str(labels.get(int(t), t)) for t in hit.tolist()]),
-                 token_ids=hit.numpy(), n_heldout=A[0, 0], target_sum=A[0, 1],
-                 conditions=np.array(conds), pred_rank=A[:, 2], p_correct=A[:, 3],
-                 logp_correct=A[:, 4], top1=A[:, 5])
-        print(f"  {k[0]} / {k[1]}: {len(conds)} conditions, {len(hit)} genes masked", flush=True)
-    print(f"wrote {len(keys)} instances -> {out}")
+
+def read_tasks(out):
+    with open(out / "tasks.tsv") as f:
+        next(f)
+        return [(int(t), b, c, int(a), int(z)) for t, b, c, a, z in
+                (line.rstrip("\n").split("\t") for line in f)]
+
+
+def stage_eval(args, e, out, task):
+    """One instance's chunk of cells: base and every condition of its plan; writes
+    parts/<batch>__<celltype>__<start>.npz."""
+    _, b, ct, start, stop = read_tasks(out)[task]
+    plan = torch.load(out / "plan.pt")["|".join((b, ct))]
+    keys, seqs, _ = load_instances(args, e, only=(b, ct))
+    if keys != [(b, ct)] or len(seqs[(b, ct)]) < stop:
+        raise RuntimeError(f"{b} / {ct} prepared differently from the shifts stage")
+    s_all = seqs[(b, ct)]
+    seed = instance_seed(args.seed, (b, ct))
+    masked = mask_positions(s_all, args.heldout_ratio, e.special, np.random.default_rng(seed + 1))
+    n_all = len(s_all)
+    cls_cells = np.sort(np.random.default_rng(seed + 2).choice(
+        n_all, min(args.cls_cells, n_all), replace=False)) if args.cls_cells else np.array([], int)
+    chunk, masked = s_all[start:stop], masked[start:stop]
+    rows = cls_cells[(cls_cells >= start) & (cls_cells < stop)]
+    ids, att = (x.to(e.device) for x in pad(chunk[:args.batch_size], e.pad_id))
+    print(f"  manual layer pass vs the model's forward: max |diff| "
+          f"{check_layers(e.model, ids, att):.1e}", flush=True)
+    conds, todo = ["base"], [(None, False)]
+    for L in args.layers:
+        for name, D in plan:
+            if L < e.n_layers:
+                conds.append(f"L{L}|ctx|{name}")
+                todo.append(((L, D[L]), False))
+            if L >= 1:
+                conds.append(f"L{L}|dir|{name}")
+                todo.append(((L, D[L]), True))
+    A, cls = predict_all(e.model, chunk, masked, todo, args.batch_size, e.device, e.special,
+                         e.pad_id, e.mask_id, cls_rows=rows - start)
+    hit = torch.nonzero(A[0, 0]).ravel()
+    (out / "parts").mkdir(exist_ok=True)
+    np.savez(out / "parts" / f"{safe(b)}__{safe(ct)}__{start}.npz",
+             ids=hit.numpy(), sums=A[:, :, hit].numpy(), conditions=np.array(conds),
+             cls=cls.numpy(), cls_cells=rows)
+    print(f"  {b} / {ct} cells {start}-{stop}: {len(conds)} conditions, {len(hit)} genes "
+          f"masked, <cls> of {len(rows)} cells", flush=True)
+
+
+def stage_merge(out):
+    """Sum each instance's parts into <batch>__<celltype>.npz: genes (n,), token_ids,
+    n_heldout, target_sum (n,), conditions (c,), pred_rank, p_correct, logp_correct,
+    top1 (c, n), cls_conditions (c,), cls (c, cells, d) float16 and cls_cells (cells,)
+    their indices in the instance."""
+    with open(out / "labels.json") as f:
+        labels = {int(k): v for k, v in json.load(f).items()}
+    by_inst = {}
+    for _, b, ct, start, _ in read_tasks(out):
+        by_inst.setdefault((b, ct), []).append(out / "parts" / f"{safe(b)}__{safe(ct)}__{start}.npz")
+    for (b, ct), paths in by_inst.items():
+        missing = [p.name for p in paths if not p.exists()]
+        if missing:
+            raise SystemExit(f"error: {b} / {ct}: missing parts {missing}; rerun those tasks")
+        parts = [np.load(p) for p in paths]
+        conds = parts[0]["conditions"]
+        ids = np.unique(np.concatenate([z["ids"] for z in parts]))
+        col = {int(i): j for j, i in enumerate(ids)}
+        A = np.zeros((len(conds), 6, len(ids)))
+        for z in parts:
+            if not np.array_equal(z["conditions"], conds):
+                raise RuntimeError(f"{b} / {ct}: parts with different conditions")
+            A[:, :, [col[int(i)] for i in z["ids"]]] += z["sums"]
+        np.savez(out / f"{safe(b)}__{safe(ct)}.npz",
+                 genes=np.array([labels.get(int(t), str(t)) for t in ids]), token_ids=ids,
+                 n_heldout=A[0, 0], target_sum=A[0, 1], conditions=conds,
+                 pred_rank=A[:, 2], p_correct=A[:, 3], logp_correct=A[:, 4], top1=A[:, 5],
+                 cls_conditions=conds,
+                 cls=np.concatenate([z["cls"] for z in parts], axis=1),
+                 cls_cells=np.concatenate([z["cls_cells"] for z in parts]))
+        print(f"  {b} / {ct}: {len(paths)} part(s), {len(ids)} genes", flush=True)
+    print(f"merged {len(by_inst)} instances -> {out}")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    out = Path(args.out)
+    if args.stage == "merge":
+        stage_merge(out)
+        return
+    if args.stage in ("all", "shifts"):
+        if out.exists() and any(out.glob("*.npz")):
+            raise SystemExit(f"error: {out} already holds results; give a new --out")
+        out.mkdir(parents=True, exist_ok=True)
+    else:
+        task = args.task if args.task is not None else int(os.environ.get("SLURM_ARRAY_TASK_ID", -1))
+        if task < 0:
+            raise SystemExit("error: --stage eval needs --task or $SLURM_ARRAY_TASK_ID")
+        if task >= len(read_tasks(out)):            # before loading the model
+            print(f"task {task}: past the last ({len(read_tasks(out)) - 1}), nothing to do")
+            return
+    e = setup(args)
+    if args.stage in ("all", "shifts"):
+        n_tasks = stage_shifts(args, e, out)
+        if args.stage == "shifts":
+            return
+        for task in range(n_tasks):
+            stage_eval(args, e, out, task)
+        stage_merge(out)
+        return
+    stage_eval(args, e, out, task)
 
 
 if __name__ == "__main__":

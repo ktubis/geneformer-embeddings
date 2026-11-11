@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # submit_offset_intervention.sh
 # Run from the LOGIN NODE, in this checkout:
-#   bash bash_scripts/submit_offset_intervention.sh --out DIR [--time HH:MM:SS] [--mem MEM]
-#       [--exclude NODES] [--dry-run] -- <scripts/offset_intervention.py options>
+#   bash bash_scripts/submit_offset_intervention.sh --out DIR [--tasks N] [--max-parallel K]
+#       [--time-shifts HH:MM:SS] [--time-eval HH:MM:SS] [--mem MEM]
+#       [--single [--time HH:MM:SS]] [--exclude NODES] [--dry-run]
+#       -- <scripts/offset_intervention.py options>
+#
+# Three chained jobs (scripts/offset_intervention.py --stage), as in scgpt_embeds'
+# submitter: shifts (one GPU job), eval (a GPU job array, one task per instance and
+# --chunk-size cells, listed in tasks.tsv), merge (CPU). The array is submitted as
+# 0..N-1 (--tasks, default 400) before tasks.tsv exists; tasks past the last exit at
+# once; if tasks.tsv lists more than N, the shifts job's log says so (submit the rest by
+# hand before the merge). --max-parallel K caps the tasks running at once (default 20).
+# --single runs everything in one job (--stage all).
 #
 # One GPU job: activation addition of the offset between instances (see the
 # docstring of scripts/offset_intervention.py), with the pretrained model
@@ -19,35 +29,42 @@
 # embeddings. Batches are file groups (--batch NAME=PATTERN[,PATTERN...], pooled:
 # site is not a factor); the healthy colon sites are the *colon files and rectum.
 #
-# Pilot (layers subsampled to measure run time and effect sizes first), two jobs:
+# Full runs (every cell, every layer, 5 random shifts):
 #   colon, every site pooled per chemistry, the six celltype_coarse types:
-#   bash bash_scripts/submit_offset_intervention.sh --out offset_runs/pilot_colon -- \
+#   bash bash_scripts/submit_offset_intervention.sh --out offset_runs/colon -- \
 #       --batch "3p=cc_10x3p_*colon,cc_10x3p_rectum" \
 #       --batch "5p=cc_10x5p_*colon,cc_10x5p_rectum" --batch-pairs 3p:5p \
 #       --celltypes "T cell" "B cell" "Plasma cell" "Myeloid cell" "Epithelial cell" "Stromal cell" \
 #       --celltype-pairs "T cell:B cell" "Epithelial cell:Stromal cell" \
 #           "Plasma cell:Stromal cell" "T cell:Epithelial cell" \
-#       --layers 0 4 9 13 17 18
-#   pancreas, baron vs a UMI (muraro) and a full-length (segerstolpe) dataset:
-#   bash bash_scripts/submit_offset_intervention.sh --out offset_runs/pilot_pancreas -- \
-#       --batch-pairs baron:muraro baron:segerstolpe --celltype-col celltype_mid \
-#       --celltypes alpha beta delta PP ductal acinar PSC \
-#       --celltype-pairs alpha:beta beta:acinar --layers 0 4 9 13 17 18
+#       --layers 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 --n-random 5
+#   pancreas, baron vs muraro (muraro calls ductal cells "duct"):
+#   bash bash_scripts/submit_offset_intervention.sh --out offset_runs/pancreas -- \
+#       --batch-pairs baron:muraro --celltype-col celltype_mid \
+#       --celltypes alpha beta "ductal=ductal,duct" acinar \
+#       --celltype-pairs alpha:beta beta:acinar \
+#       --layers 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 --n-random 5
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"       # this checkout, bound to /mnt
 MODEL_SUBDIR="Geneformer-V2-316M"
 HOST_DATA="/cluster/work/boeva/ktubis/data"                    # bound to /data
-OUT=""; TIME="08:00:00"; MEM="128G"; EXCLUDE="gpu-biomed-03,gpu-biomed-07,gpu-biomed-08"
-DRY=false; PASS=()
+OUT=""; TIME="08:00:00"; TIME_SHIFTS="12:00:00"; TIME_EVAL="08:00:00"; MEM="128G"
+TASKS=400; PAR=20; EXCLUDE="gpu-biomed-03,gpu-biomed-07,gpu-biomed-08"; DRY=false; SINGLE=false
+PASS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --out)     OUT="$2"; shift 2 ;;
-        --time)    TIME="$2"; shift 2 ;;
-        --mem)     MEM="$2"; shift 2 ;;
-        --exclude) EXCLUDE="$2"; shift 2 ;;
-        --dry-run) DRY=true; shift ;;
-        --)        shift; PASS=("$@"); break ;;
+        --out)          OUT="$2"; shift 2 ;;
+        --time)         TIME="$2"; shift 2 ;;
+        --time-shifts)  TIME_SHIFTS="$2"; shift 2 ;;
+        --time-eval)    TIME_EVAL="$2"; shift 2 ;;
+        --mem)          MEM="$2"; shift 2 ;;
+        --tasks)        TASKS="$2"; shift 2 ;;
+        --max-parallel) PAR="$2"; shift 2 ;;
+        --single)       SINGLE=true; shift ;;
+        --exclude)      EXCLUDE="$2"; shift 2 ;;
+        --dry-run)      DRY=true; shift ;;
+        --)             shift; PASS=("$@"); break ;;
         *) echo "error: unrecognized arg '$1' (script options go after --)" >&2; exit 1 ;;
     esac
 done
@@ -89,15 +106,37 @@ SIF_RUN="singularity exec --nv \
 
 ARGS=$(printf '%q ' "${PASS[@]}")
 NAME="gf_offset_$(basename "$OUT")"
-CMD="echo 'geneformer code: ${CODE_COMMIT}'; ${SIF_RUN} python /mnt/scripts/offset_intervention.py \
+RUN="${SIF_RUN} python /mnt/scripts/offset_intervention.py \
     --data-dir /data/final_datasets --model-dir /mnt/${MODEL_SUBDIR} --nproc 4 \
     --out ${OUT} ${ARGS}"
+GPU="--partition=gpu --gres=gpu:1 ${EXCLUDE:+--exclude=$EXCLUDE} --mem=$MEM --cpus-per-task=4"
+LOG="${REPO}/logs/${NAME}"
+HEAD="echo 'geneformer code: ${CODE_COMMIT}';"
 
 mkdir -p "${REPO}/logs"
+if $SINGLE; then
+    $DRY && { echo "${RUN} --stage all"; exit 0; }
+    sbatch $GPU --time="$TIME" --job-name="${NAME:0:64}" --output="${LOG}_%j.out" \
+        --wrap="${HEAD} ${RUN} --stage all"
+    exit $?
+fi
 if $DRY; then
-    echo "$CMD"
+    echo "shifts: ${RUN} --stage shifts"
+    echo "eval:   ${RUN} --stage eval   (array task = \$SLURM_ARRAY_TASK_ID)"
+    echo "merge:  ${SIF_RUN} python /mnt/scripts/offset_intervention.py --out ${OUT} --stage merge"
     exit 0
 fi
-sbatch --partition=gpu --gres=gpu:1 ${EXCLUDE:+--exclude="$EXCLUDE"} --mem="$MEM" --cpus-per-task=4 \
-    --time="$TIME" --job-name="${NAME:0:64}" --output="${REPO}/logs/${NAME}_%j.out" \
-    --wrap="$CMD"
+J1=$(sbatch --parsable $GPU --time="$TIME_SHIFTS" --job-name="${NAME:0:56}_shifts" \
+    --output="${LOG}_shifts_%j.out" \
+    --wrap="${HEAD} ${RUN} --stage shifts; n=\$(( \$(wc -l < ${REPO}/${OUT}/tasks.tsv) - 1 )); \
+            [ \$n -le ${TASKS} ] || echo \"WARNING: \$n tasks > --tasks ${TASKS}: submit the rest\"") \
+    || { echo "sbatch (shifts) failed" >&2; exit 1; }
+J2=$(sbatch --parsable $GPU --time="$TIME_EVAL" --array="0-$((TASKS - 1))%${PAR}" \
+    --dependency=afterok:${J1} --job-name="${NAME:0:58}_eval" --output="${LOG}_eval_%A_%a.out" \
+    --wrap="${HEAD} ${RUN} --stage eval") \
+    || { echo "sbatch (eval) failed" >&2; exit 1; }
+J3=$(sbatch --parsable --cpus-per-task=2 --mem=32G --time=02:00:00 --dependency=afterok:${J2} \
+    --job-name="${NAME:0:57}_merge" --output="${LOG}_merge_%j.out" \
+    --wrap="${SIF_RUN} python /mnt/scripts/offset_intervention.py --out ${OUT} --stage merge") \
+    || { echo "sbatch (merge) failed" >&2; exit 1; }
+echo "shifts ${J1}, eval ${J2} (tasks 0-$((TASKS - 1)), ${PAR} at a time), merge ${J3}"
